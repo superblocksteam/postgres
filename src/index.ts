@@ -6,6 +6,7 @@ import {
   PostgresActionConfiguration,
   PostgresDatasourceConfiguration,
   RawRequest,
+  ResolvedActionConfigurationProperty,
   Table,
   TableType
 } from '@superblocksteam/shared';
@@ -31,7 +32,7 @@ export default class PostgresPlugin extends BasePlugin {
     property,
     escapeStrings
   }: // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  ActionConfigurationResolutionContext): Promise<string | any[]> {
+  ActionConfigurationResolutionContext): Promise<ResolvedActionConfigurationProperty> {
     return resolveActionConfigurationPropertyUtil(super.resolveActionConfigurationProperty, {
       context,
       actionConfiguration,
@@ -87,7 +88,8 @@ export default class PostgresPlugin extends BasePlugin {
         const entity = acc.find((o) => o.name === entityName);
         if (entity) {
           const columns = entity.columns;
-          entity.columns = [...columns, new Column(attribute.name, attribute.column_type)];
+          const isColumnNameCased = !(attribute.name === attribute.name.toLowerCase());
+          entity.columns = [...columns, new Column(isColumnNameCased ? `"${attribute.name}"` : attribute.name, attribute.column_type)];
           return [...acc];
         }
 
