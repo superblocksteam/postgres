@@ -12,10 +12,12 @@ import {
 } from '@superblocksteam/shared';
 import {
   ActionConfigurationResolutionContext,
-  BasePlugin,
   normalizeTableColumnNames,
   PluginExecutionProps,
-  resolveActionConfigurationPropertyUtil
+  resolveActionConfigurationPropertyUtil,
+  DatabasePlugin,
+  CreateConnection,
+  DestroyConnection
 } from '@superblocksteam/shared-backend';
 import { isEmpty } from 'lodash';
 import { Client, Notification } from 'pg';
@@ -24,8 +26,8 @@ import { KeysQuery, TableQuery } from './queries';
 
 const TEST_CONNECTION_TIMEOUT = 5000;
 
-export default class PostgresPlugin extends BasePlugin {
-  async resolveActionConfigurationProperty({
+export default class PostgresPlugin extends DatabasePlugin {
+  public async resolveActionConfigurationProperty({
     context,
     actionConfiguration,
     files,
@@ -33,54 +35,65 @@ export default class PostgresPlugin extends BasePlugin {
     escapeStrings
   }: // eslint-disable-next-line @typescript-eslint/no-explicit-any
   ActionConfigurationResolutionContext): Promise<ResolvedActionConfigurationProperty> {
-    return resolveActionConfigurationPropertyUtil(super.resolveActionConfigurationProperty, {
-      context,
-      actionConfiguration,
-      files,
-      property,
-      escapeStrings
-    });
+    return this.tracer.startActiveSpan(
+      'plugin.resolveActionConfigurationProperty',
+      { attributes: this.getTraceTags(), kind: 1 /* SpanKind.SERVER */ },
+      async (span) => {
+        const resolvedProperties = resolveActionConfigurationPropertyUtil(super.resolveActionConfigurationProperty, {
+          context,
+          actionConfiguration,
+          files,
+          property,
+          escapeStrings
+        });
+        span.end();
+        return resolvedProperties;
+      }
+    );
   }
 
-  async execute({
+  public async execute({
     context,
     datasourceConfiguration,
     actionConfiguration
   }: PluginExecutionProps<PostgresDatasourceConfiguration>): Promise<ExecutionOutput> {
-    const client = await this.createClient(datasourceConfiguration);
-    try {
-      const query = actionConfiguration.body;
-      const ret = new ExecutionOutput();
-      if (isEmpty(query)) {
-        return ret;
-      }
-      const rows = await client.query(query, context.preparedStatementContext);
-      ret.output = normalizeTableColumnNames(rows.rows);
+    const client = await this.createConnection(datasourceConfiguration);
+    const query = actionConfiguration.body;
+    const ret = new ExecutionOutput();
+    if (isEmpty(query)) {
       return ret;
+    }
+    let rows;
+    try {
+      rows = await this.executeQuery(() => {
+        return client.query(query, context.preparedStatementContext);
+      });
     } catch (err) {
       throw new IntegrationError(`Postgres query failed, ${err.message}`);
     } finally {
       if (client) {
-        await client.end();
+        this.destroyConnection(client);
       }
     }
+    ret.output = normalizeTableColumnNames(rows.rows);
+    return ret;
   }
 
-  getRequest(actionConfiguration: PostgresActionConfiguration): RawRequest {
+  public getRequest(actionConfiguration: PostgresActionConfiguration): RawRequest {
     return actionConfiguration?.body;
   }
 
-  dynamicProperties(): string[] {
+  public dynamicProperties(): string[] {
     return ['body'];
   }
 
-  async metadata(datasourceConfiguration: PostgresDatasourceConfiguration): Promise<DatasourceMetadataDto> {
-    let client: Client | undefined;
+  public async metadata(datasourceConfiguration: PostgresDatasourceConfiguration): Promise<DatasourceMetadataDto> {
+    const client = await this.createConnection(datasourceConfiguration);
     try {
-      client = await this.createClient(datasourceConfiguration);
-      // tables
-      const tableResult = await client.query(TableQuery);
-
+      // table
+      const tableResult = await this.executeQuery(async () => {
+        return client.query(TableQuery);
+      });
       const entities = tableResult.rows.reduce((acc, attribute) => {
         const entityName = attribute['table_name'];
         const entityType = TableType.TABLE;
@@ -100,7 +113,9 @@ export default class PostgresPlugin extends BasePlugin {
       }, []);
 
       // keys
-      const keysResult = await client.query(KeysQuery);
+      const keysResult = await this.executeQuery(async () => {
+        return client.query(KeysQuery);
+      });
       keysResult.rows.forEach((key) => {
         const table = entities.find((e) => e.name === key.self_table);
         if (table) {
@@ -114,57 +129,62 @@ export default class PostgresPlugin extends BasePlugin {
       throw new IntegrationError(`Failed to connect to Postgres, ${err.message}`);
     } finally {
       if (client) {
-        await client.end();
+        this.destroyConnection(client);
       }
     }
   }
 
-  private async createClient(datasourceConfiguration: PostgresDatasourceConfiguration, connectionTimeoutMillis = 30000): Promise<Client> {
+  @CreateConnection
+  private async createConnection(
+    datasourceConfiguration: PostgresDatasourceConfiguration,
+    connectionTimeoutMillis = 30000
+  ): Promise<Client> {
     if (!datasourceConfiguration) {
       throw new IntegrationError('Datasource not found for Postgres step');
     }
-    try {
-      const endpoint = datasourceConfiguration.endpoint;
-      const auth = datasourceConfiguration.authentication;
-      if (!endpoint) {
-        throw new IntegrationError('Endpoint not specified for Postgres step');
-      }
-      if (!auth) {
-        throw new IntegrationError('Authentication not specified for Postgres step');
-      }
-      if (!auth.custom?.databaseName?.value) {
-        throw new IntegrationError('Database not specified for Postgres step');
-      }
-
-      let ssl_config: Record<string, unknown> | undefined;
-      if (datasourceConfiguration.connection?.useSsl) {
-        ssl_config = {
-          rejectUnauthorized: false
-        };
-        if (datasourceConfiguration.connection?.useSelfSignedSsl) {
-          ssl_config.ca = datasourceConfiguration.connection?.ca;
-          ssl_config.key = datasourceConfiguration.connection?.key;
-          ssl_config.cert = datasourceConfiguration.connection?.cert;
-        }
-      }
-
-      const client = new Client({
-        host: endpoint.host,
-        user: auth.username,
-        password: auth.password,
-        database: auth.custom.databaseName.value,
-        port: endpoint.port,
-        ssl: ssl_config,
-        connectionTimeoutMillis: connectionTimeoutMillis
-      });
-      this.attachLoggerToClient(client, datasourceConfiguration);
-
-      await client.connect();
-      this.logger.debug(`Postgres client connected. ${datasourceConfiguration.endpoint?.host}:${datasourceConfiguration.endpoint?.port}`);
-      return client;
-    } catch (err) {
-      throw new IntegrationError(`Failed to connect to Postgres, ${err.message}`);
+    const endpoint = datasourceConfiguration.endpoint;
+    const auth = datasourceConfiguration.authentication;
+    if (!endpoint) {
+      throw new IntegrationError('Endpoint not specified for Postgres step');
     }
+    if (!auth) {
+      throw new IntegrationError('Authentication not specified for Postgres step');
+    }
+    if (!auth.custom?.databaseName?.value) {
+      throw new IntegrationError('Database not specified for Postgres step');
+    }
+
+    let ssl_config: Record<string, unknown> | undefined;
+    if (datasourceConfiguration.connection?.useSsl) {
+      ssl_config = {
+        rejectUnauthorized: false
+      };
+      if (datasourceConfiguration.connection?.useSelfSignedSsl) {
+        ssl_config.ca = datasourceConfiguration.connection?.ca;
+        ssl_config.key = datasourceConfiguration.connection?.key;
+        ssl_config.cert = datasourceConfiguration.connection?.cert;
+      }
+    }
+
+    const client = new Client({
+      host: endpoint.host,
+      user: auth.username,
+      password: auth.password,
+      database: auth.custom.databaseName.value,
+      port: endpoint.port,
+      ssl: ssl_config,
+      connectionTimeoutMillis: connectionTimeoutMillis
+    });
+    this.attachLoggerToClient(client, datasourceConfiguration);
+
+    await client.connect();
+    this.logger.debug(`Postgres client connected. ${datasourceConfiguration.endpoint?.host}:${datasourceConfiguration.endpoint?.port}`);
+    return client;
+  }
+
+  @DestroyConnection
+  private async destroyConnection(client: Client): Promise<void> {
+    await client.end();
   }
 
   private attachLoggerToClient(client: Client, datasourceConfiguration: PostgresDatasourceConfiguration) {
@@ -191,16 +211,18 @@ export default class PostgresPlugin extends BasePlugin {
     });
   }
 
-  async test(datasourceConfiguration: PostgresDatasourceConfiguration): Promise<void> {
+  public async test(datasourceConfiguration: PostgresDatasourceConfiguration): Promise<void> {
     let client: Client | null = null;
     try {
-      client = await this.createClient(datasourceConfiguration, TEST_CONNECTION_TIMEOUT);
-      await client.query('SELECT NOW()');
+      client = await this.createConnection(datasourceConfiguration, TEST_CONNECTION_TIMEOUT);
+      await this.executeQuery(() => {
+        return client.query('SELECT NOW()');
+      });
     } catch (err) {
       throw new IntegrationError(`Test Postgres connection failed, ${err.message}`);
     } finally {
       if (client) {
-        await client.end();
+        this.destroyConnection(client);
       }
     }
   }
