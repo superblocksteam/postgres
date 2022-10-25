@@ -6,15 +6,12 @@ import {
   PostgresActionConfiguration,
   PostgresDatasourceConfiguration,
   RawRequest,
-  ResolvedActionConfigurationProperty,
   Table,
   TableType
 } from '@superblocksteam/shared';
 import {
-  ActionConfigurationResolutionContext,
   normalizeTableColumnNames,
   PluginExecutionProps,
-  resolveActionConfigurationPropertyUtil,
   DatabasePlugin,
   CreateConnection,
   DestroyConnection
@@ -27,29 +24,8 @@ import { KeysQuery, TableQuery } from './queries';
 const TEST_CONNECTION_TIMEOUT = 5000;
 
 export default class PostgresPlugin extends DatabasePlugin {
-  public async resolveActionConfigurationProperty({
-    context,
-    actionConfiguration,
-    files,
-    property,
-    escapeStrings
-  }: // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  ActionConfigurationResolutionContext): Promise<ResolvedActionConfigurationProperty> {
-    return this.tracer.startActiveSpan(
-      'plugin.resolveActionConfigurationProperty',
-      { attributes: this.getTraceTags(), kind: 1 /* SpanKind.SERVER */ },
-      async (span) => {
-        const resolvedProperties = resolveActionConfigurationPropertyUtil(super.resolveActionConfigurationProperty, {
-          context,
-          actionConfiguration,
-          files,
-          property,
-          escapeStrings
-        });
-        span.end();
-        return resolvedProperties;
-      }
-    );
+  constructor() {
+    super({ useOrderedParameters: true });
   }
 
   public async execute({
@@ -72,7 +48,9 @@ export default class PostgresPlugin extends DatabasePlugin {
       throw new IntegrationError(`Postgres query failed, ${err.message}`);
     } finally {
       if (client) {
-        this.destroyConnection(client);
+        this.destroyConnection(client).catch(() => {
+          // Error handling is done in the decorator
+        });
       }
     }
     ret.output = normalizeTableColumnNames(rows.rows);
@@ -129,7 +107,9 @@ export default class PostgresPlugin extends DatabasePlugin {
       throw new IntegrationError(`Failed to connect to Postgres, ${err.message}`);
     } finally {
       if (client) {
-        this.destroyConnection(client);
+        this.destroyConnection(client).catch(() => {
+          // Error handling is done in the decorator
+        });
       }
     }
   }
@@ -222,7 +202,9 @@ export default class PostgresPlugin extends DatabasePlugin {
       throw new IntegrationError(`Test Postgres connection failed, ${err.message}`);
     } finally {
       if (client) {
-        this.destroyConnection(client);
+        this.destroyConnection(client).catch(() => {
+          // Error handling is done in the decorator
+        });
       }
     }
   }
