@@ -12,7 +12,7 @@ import {
 import {
   normalizeTableColumnNames,
   PluginExecutionProps,
-  DatabasePlugin,
+  DatabasePluginPooled,
   CreateConnection,
   DestroyConnection
 } from '@superblocksteam/shared-backend';
@@ -23,17 +23,11 @@ import { KeysQuery, TableQuery } from './queries';
 
 const TEST_CONNECTION_TIMEOUT = 5000;
 
-export default class PostgresPlugin extends DatabasePlugin {
-  constructor() {
-    super({ useOrderedParameters: true });
-  }
-
-  public async execute({
-    context,
-    datasourceConfiguration,
-    actionConfiguration
-  }: PluginExecutionProps<PostgresDatasourceConfiguration>): Promise<ExecutionOutput> {
-    const client = await this.createConnection(datasourceConfiguration);
+export default class PostgresPlugin extends DatabasePluginPooled<Client, PostgresDatasourceConfiguration> {
+  public async executePooled(
+    { context, actionConfiguration }: PluginExecutionProps<PostgresDatasourceConfiguration>,
+    client: Client
+  ): Promise<ExecutionOutput> {
     const query = actionConfiguration.body;
     const ret = new ExecutionOutput();
     if (isEmpty(query)) {
@@ -46,12 +40,6 @@ export default class PostgresPlugin extends DatabasePlugin {
       });
     } catch (err) {
       throw new IntegrationError(`Postgres query failed, ${err.message}`);
-    } finally {
-      if (client) {
-        this.destroyConnection(client).catch(() => {
-          // Error handling is done in the decorator
-        });
-      }
     }
     ret.output = normalizeTableColumnNames(rows.rows);
     return ret;
@@ -115,7 +103,7 @@ export default class PostgresPlugin extends DatabasePlugin {
   }
 
   @CreateConnection
-  private async createConnection(
+  protected async createConnection(
     datasourceConfiguration: PostgresDatasourceConfiguration,
     connectionTimeoutMillis = 30000
   ): Promise<Client> {
@@ -163,7 +151,7 @@ export default class PostgresPlugin extends DatabasePlugin {
   }
 
   @DestroyConnection
-  private async destroyConnection(client: Client): Promise<void> {
+  protected async destroyConnection(client: Client): Promise<void> {
     await client.end();
   }
 
